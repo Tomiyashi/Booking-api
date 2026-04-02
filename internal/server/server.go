@@ -4,9 +4,10 @@ import (
 	"booking-api/internal/models"
 	"database/sql"
 	"encoding/json"
-	"log"
 	"net/http"
-	"strings"
+	"time"
+
+	"github.com/google/uuid"
 )
 
 type Server struct {
@@ -19,17 +20,76 @@ func (s *Server) InfoHandler(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte("OK"))
 }
 
-// POST /dummyLogin
-func (s *Server) DummyLoginHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"token": "fixed-test-token"})
+// POST /admin/rooms
+func (s *Server) CreateRoomHandler(w http.ResponseWriter, r *http.Request) {
+	var rm struct {
+		Name        string `json:"name"`
+		Description string `json:"description"`
+		Capacity    int    `json:"capacity"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&rm); err != nil {
+		http.Error(w, "invalid body", 400)
+		return
+	}
+	id := uuid.New().String()
+	_, err := s.DB.Exec(`INSERT INTO rooms (id, name, description, capacity) VALUES ($1, $2, $3, $4)`,
+		id, rm.Name, rm.Description, rm.Capacity)
+	if err != nil {
+		http.Error(w, "db error", 500)
+		return
+	}
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(map[string]string{"id": id})
+}
+
+// POST /admin/rooms/{id}/schedule
+func (s *Server) CreateScheduleHandler(w http.ResponseWriter, r *http.Request) {
+	roomID := r.PathValue("id")
+	var req struct {
+		DaysOfWeek []int  `json:"daysOfWeek"`
+		StartTime  string `json:"startTime"`
+		EndTime    string `json:"endTime"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid body", 400)
+		return
+	}
+
+	startT, _ := time.Parse("15:04", req.StartTime)
+	endT, _ := time.Parse("15:04", req.EndTime)
+
+	tx, _ := s.DB.Begin()
+	for i := 0; i < 7; i++ {
+		date := time.Now().AddDate(0, 0, i)
+		isTargetDay := false
+		for _, d := range req.DaysOfWeek {
+			if int(date.Weekday()) == d {
+				isTargetDay = true
+				break
+			}
+		}
+		if !isTargetDay {
+			continue
+		}
+
+		curr := time.Date(date.Year(), date.Month(), date.Day(), startT.Hour(), startT.Minute(), 0, 0, time.UTC)
+		limit := time.Date(date.Year(), date.Month(), date.Day(), endT.Hour(), endT.Minute(), 0, 0, time.UTC)
+
+		for curr.Before(limit) {
+			slotEnd := curr.Add(30 * time.Minute)
+			tx.Exec(`INSERT INTO slots (id, room_id, start_time, end_time) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING`,
+				uuid.New().String(), roomID, curr, slotEnd)
+			curr = slotEnd
+		}
+	}
+	tx.Commit()
+	w.WriteHeader(http.StatusCreated)
 }
 
 // GET /rooms/list
-func (s *Server) GetAllRoomHandler(w http.ResponseWriter, r *http.Request) {
+func (s *Server) ListRoomsHandler(w http.ResponseWriter, r *http.Request) {
 	rows, err := s.DB.Query("SELECT id, name, description, capacity FROM rooms")
 	if err != nil {
-		log.Printf("Ошибка получения списка комнат: %v", err)
 		http.Error(w, "Internal Server Error", 500)
 		return
 	}
@@ -38,27 +98,20 @@ func (s *Server) GetAllRoomHandler(w http.ResponseWriter, r *http.Request) {
 	var rooms []models.Room
 	for rows.Next() {
 		var rm models.Room
-		if err := rows.Scan(&rm.ID, &rm.Name, &rm.Description, &rm.Capacity); err != nil {
-			continue
-		}
+		rows.Scan(&rm.ID, &rm.Name, &rm.Description, &rm.Capacity)
 		rooms = append(rooms, rm)
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(rooms)
 }
 
-// GET /rooms/{id}/slots?date=YYYY-MM-DD
-func (s *Server) GetSlotsHandler(w http.ResponseWriter, r *http.Request) {
-	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
-	if len(parts) < 2 {
-		http.Error(w, "Room ID required", 400)
-		return
-	}
-	roomID := parts[1]
+// GET /rooms/{id}/slots
+func (s *Server) ListSlotsHandler(w http.ResponseWriter, r *http.Request) {
+	roomID := r.PathValue("id")
 	dateStr := r.URL.Query().Get("date")
 
 	if dateStr == "" {
-		http.Error(w, "Date parameter is required", 400)
+		http.Error(w, "Date required", 400)
 		return
 	}
 
@@ -71,12 +124,12 @@ func (s *Server) GetSlotsHandler(w http.ResponseWriter, r *http.Request) {
 
 	rows, err := s.DB.Query(query, roomID, dateStr)
 	if err != nil {
-		http.Error(w, "Database error", 500)
+		http.Error(w, "DB error", 500)
 		return
 	}
 	defer rows.Close()
 
-	var slots []models.Slot
+	slots := []models.Slot{} // Инициализируем пустым слайсом вместо nil
 	for rows.Next() {
 		var sl models.Slot
 		rows.Scan(&sl.ID, &sl.RoomID, &sl.StartTime, &sl.EndTime)
@@ -92,71 +145,71 @@ func (s *Server) CreateBookingHandler(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		SlotID string `json:"slotId"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "Invalid JSON", 400)
-		return
-	}
+	json.NewDecoder(r.Body).Decode(&req)
 
-	// Заглушка ID пользователя для тестов
-	userID := "00000000-0000-0000-0000-000000000001"
+	bookingID := uuid.New().String()
+	userID := "00000000-0000-0000-0000-000000000001" // В идеале из JWT
 
-	var bookingID string
-	query := `INSERT INTO bookings (slot_id, user_id, status) VALUES ($1, $2, 'active') RETURNING id`
-	err := s.DB.QueryRow(query, req.SlotID, userID).Scan(&bookingID)
+	query := `INSERT INTO bookings (id, slot_id, user_id, status) VALUES ($1, $2, $3, 'active')`
+	_, err := s.DB.Exec(query, bookingID, req.SlotID, userID)
 
 	if err != nil {
-		http.Error(w, "Slot already booked or invalid", http.StatusConflict)
+		http.Error(w, "Already booked", 409)
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	json.NewEncoder(w).Encode(map[string]string{"id": bookingID})
 }
 
 // POST /bookings/{id}/cancel
 func (s *Server) CancelBookingHandler(w http.ResponseWriter, r *http.Request) {
-	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
-	if len(parts) < 2 {
-		http.Error(w, "Booking ID required", 400)
-		return
-	}
-	bookingID := parts[1]
-
-	query := `UPDATE bookings SET status = 'cancelled' WHERE id = $1`
-	res, err := s.DB.Exec(query, bookingID)
+	id := r.PathValue("id")
+	_, err := s.DB.Exec(`UPDATE bookings SET status = 'cancelled' WHERE id = $1`, id)
 	if err != nil {
-		http.Error(w, "DB Error", 500)
+		http.Error(w, "DB error", 500)
 		return
 	}
-
-	rows, _ := res.RowsAffected()
-	if rows == 0 {
-		http.Error(w, "Booking not found", 404)
-		return
-	}
-
 	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("Cancelled"))
 }
 
-// Общий обработчик для сложных путей
-func (s *Server) RoutesHandler(w http.ResponseWriter, r *http.Request) {
-	path := r.URL.Path
-
-	if strings.HasPrefix(path, "/rooms/") && strings.HasSuffix(path, "/slots") {
-		if r.Method == http.MethodGet {
-			s.GetSlotsHandler(w, r)
-			return
-		}
+// GET /bookings/my
+func (s *Server) ListMyBookingsHandler(w http.ResponseWriter, r *http.Request) {
+	userID := "00000000-0000-0000-0000-000000000001"
+	rows, err := s.DB.Query(`SELECT id, slot_id, status FROM bookings WHERE user_id = $1 AND status = 'active'`, userID)
+	if err != nil {
+		http.Error(w, "DB error", 500)
+		return
 	}
+	defer rows.Close()
 
-	if strings.HasPrefix(path, "/bookings/") && strings.HasSuffix(path, "/cancel") {
-		if r.Method == http.MethodPost {
-			s.CancelBookingHandler(w, r)
-			return
-		}
+	var bookings []map[string]string
+	for rows.Next() {
+		var id, sid, stat string
+		rows.Scan(&id, &sid, &stat)
+		bookings = append(bookings, map[string]string{"id": id, "slotId": sid, "status": stat})
 	}
+	json.NewEncoder(w).Encode(bookings)
+}
 
-	http.NotFound(w, r)
+// GET /admin/bookings
+func (s *Server) ListAllBookingsHandler(w http.ResponseWriter, r *http.Request) {
+	rows, err := s.DB.Query(`SELECT id, slot_id, user_id, status FROM bookings`)
+	if err != nil {
+		http.Error(w, "DB error", 500)
+		return
+	}
+	defer rows.Close()
+
+	bookings := []map[string]string{}
+	for rows.Next() {
+		var id, sid, uid, stat string
+		rows.Scan(&id, &sid, &uid, &stat)
+		bookings = append(bookings, map[string]string{"id": id, "slotId": sid, "userId": uid, "status": stat})
+	}
+	json.NewEncoder(w).Encode(bookings)
+}
+
+func (s *Server) DummyLoginHandler(w http.ResponseWriter, r *http.Request) {
+	json.NewEncoder(w).Encode(map[string]string{"token": "fixed-test-token"})
 }

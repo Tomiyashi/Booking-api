@@ -30,14 +30,21 @@ func main() {
 
 	mux := http.NewServeMux()
 
-	mux.HandleFunc("/_info", srv.InfoHandler)
-	mux.HandleFunc("/dummyLogin", srv.DummyLoginHandler)
-	mux.HandleFunc("/rooms/list", srv.GetAllRoomHandler)
-	mux.HandleFunc("/bookings/create", srv.CreateBookingHandler)
+	// Public & Health
+	mux.HandleFunc("GET /_info", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) })
+	mux.HandleFunc("POST /dummyLogin", srv.DummyLoginHandler)
 
-	mux.HandleFunc("/rooms/", srv.RoutesHandler)
-	mux.HandleFunc("/bookings/", srv.RoutesHandler)
+	// Admin (нужна проверка роли "admin" в токене)
+	mux.HandleFunc("POST /admin/rooms", srv.CreateRoomHandler)
+	mux.HandleFunc("POST /admin/rooms/{id}/schedule", srv.CreateScheduleHandler)
+	mux.HandleFunc("GET /admin/bookings", srv.ListAllBookingsHandler)
 
+	// User (нужна проверка роли "user" в токене)
+	mux.HandleFunc("GET /rooms/list", srv.ListRoomsHandler)
+	mux.HandleFunc("GET /rooms/{id}/slots", srv.ListSlotsHandler)
+	mux.HandleFunc("POST /bookings/create", srv.CreateBookingHandler)
+	mux.HandleFunc("POST /bookings/{id}/cancel", srv.CancelBookingHandler)
+	mux.HandleFunc("GET /bookings/my", srv.ListMyBookingsHandler)
 	log.Println("Server started on :8080")
 	if err := http.ListenAndServe(":8080", mux); err != nil {
 		log.Fatal("ListenAndServe: ", err)

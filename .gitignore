@@ -1,0 +1,16 @@
+# Исполняемые файлы (бинарники)
+*.exe
+test_build.exe
+booking-api
+main
+
+# Папки зависимостей
+vendor/
+
+# Настройки редактора
+.vscode/
+.idea/
+
+# Временные файлы
+*.log
+.DS_Store
